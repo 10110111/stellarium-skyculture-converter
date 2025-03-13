@@ -3,13 +3,18 @@
 #include <set>
 #include <map>
 #include <deque>
+#include <cctype>
 #include <string_view>
 #include <unordered_map>
 #include <QDir>
 #include <QFile>
 #include <QDebug>
+#include <QTextStream>
+#include <QDomDocument>
 #include <QRegularExpression>
 #include <gettext-po.h>
+#include <tidy/tidy.h>
+#include <tidy/tidybuffio.h>
 #include "NamesOldLoader.hpp"
 #include "AsterismOldLoader.hpp"
 #include "ConstellationOldLoader.hpp"
@@ -48,55 +53,6 @@ constexpr auto SkipEmptyParts = QString::SkipEmptyParts;
 const QRegularExpression htmlSimpleImageRegex(R"reg(<img\b[^>/]*(?:\s+alt="([^"]+)")?\s+src="([^"]+)"(?:\s+alt="([^"]+)")?\s*/?>)reg");
 const QRegularExpression htmlGeneralImageRegex(R"reg(<img\b[^>/]*\s+src="([^"]+)"[^>/]*/?>)reg");
 
-void htmlListsToMarkdown(QString& string, const bool convertOrderedLists)
-{
-	// This will only handle lists whose entries don't contain HTML tags, and the
-	// lists don't contain anything except <li> entries (in particular, no comments).
-
-	static const QRegularExpression entryPattern(R"reg(<li\b\s*[^>]*>\s*([^<]+)\s*</li\s*>)reg");
-	static const QRegularExpression ulistPattern(R"reg(<ul\s*>\s*(?:<li\b\s*[^>]*>[^<]+</li\s*>\s*)+</ul\s*>)reg");
-	static const QRegularExpression outerUListTagPattern(R"reg(</?ul\s*>)reg");
-	for(auto matches = ulistPattern.globalMatch(string); matches.hasNext(); )
-	{
-		const auto& match = matches.next();
-		auto list = match.captured(0);
-		list.replace(outerUListTagPattern, "\n");
-		list.replace(entryPattern, "\n - \\1\n");
-		string.replace(match.captured(0), list);
-	}
-
-	if(convertOrderedLists)
-	{
-		static const QRegularExpression olistPattern(R"reg(<ol\s*>\s*(?:<li\b\s*[^>]*>[^<]+</li\s*>\s*)+</ol\s*>)reg");
-		static const QRegularExpression outerOListTagPattern(R"reg(</?ol\s*>)reg");
-		for(auto matches = olistPattern.globalMatch(string); matches.hasNext(); )
-		{
-			const auto& match = matches.next();
-			auto list = match.captured(0);
-			list.replace(outerOListTagPattern, "\n");
-			list.replace(entryPattern, "\n 1. \\1\n");
-			string.replace(match.captured(0), list);
-		}
-	}
-}
-
-void htmlBlockQuoteToMarkdown(QString& string)
-{
-	static const QRegularExpression blockquotePattern(R"reg(<blockquote\s*>\s*[^<]*</blockquote\s*>)reg");
-	static const QRegularExpression outerBQTagPattern(R"reg(\s*</?blockquote\s*>\s*)reg");
-	static const QRegularExpression emptyFinalLines(R"reg((?:\n> *)+\n*$)reg");
-	for(auto matches = blockquotePattern.globalMatch(string); matches.hasNext(); )
-	{
-		const auto& match = matches.next();
-		auto blockquote = match.captured(0).trimmed();
-		blockquote.replace(outerBQTagPattern, "\n");
-		blockquote.replace("\n", "\n> ");
-		blockquote.replace(emptyFinalLines, "\n");
-		blockquote = "\n" + blockquote + "\n";
-		string.replace(match.captured(0), blockquote);
-	}
-}
-
 void formatDescriptionLists(QString& string)
 {
 	// We don't convert DLs into Markdown (since there's no such
@@ -106,143 +62,6 @@ void formatDescriptionLists(QString& string)
 //	string.replace(QRegularExpression("(<dd\\s*>)"), "\n\t\\1");
 	string.replace(QRegularExpression("(</dd\\s*>)"), "\\1\n");
 	string.replace(QRegularExpression("(</dd\\s*>)\n </dl>"), "\\1\n</dl>");
-}
-
-void htmlTablesToMarkdown(QString& string)
-{
-	// Using a single regex to find all tables without merging them into
-	// one capture appears to be too hard. Let's go in a lower-level way,
-	// by finding all the beginnings and ends manually.
-	const QRegularExpression tableBorderPattern(R"reg((<table\b[^>]*>)|(</table\s*>))reg");
-	bool foundStart = false;
-	int startPos = -1, tagStartPos = -1;
-	QStringList tables;
-	std::vector<std::pair<int,int>> tablesPositions;
-	bool isLayoutTable = false;
-	for(auto matches = tableBorderPattern.globalMatch(string); matches.hasNext(); )
-	{
-		const auto& match = matches.next();
-		const auto& startCap = match.captured(1);
-		const auto& endCap = match.captured(2);
-		if(!startCap.isEmpty() && endCap.isEmpty() && !foundStart)
-		{
-			foundStart = true;
-			tagStartPos = match.capturedStart(1);
-			startPos = match.capturedEnd(1);
-			isLayoutTable = startCap.contains("class=\"layout\"");
-		}
-		else if(startCap.isEmpty() && !endCap.isEmpty() && foundStart)
-		{
-			foundStart = false;
-			Q_ASSERT(startPos >= 0);
-			Q_ASSERT(tagStartPos >= 0);
-			const auto endPos = match.capturedStart(2);
-			const auto tagEndPos = match.capturedEnd(2);
-			if(!isLayoutTable)
-			{
-				tables += string.mid(startPos, endPos - startPos);
-				tablesPositions.emplace_back(tagStartPos, tagEndPos);
-			}
-		}
-		else
-		{
-			qWarning() << "Inconsistency between table start and end tags detected, can't process tables further";
-			return;
-		}
-	}
-
-	// Now do the actual conversion
-	for(int n = 0; n < tables.size(); ++n)
-	{
-		const auto& table = tables[n];
-		if(table.contains(QRegularExpression("\\s(?:col|row)span=")))
-		{
-			qWarning() << "Row/column spans are not supported, leaving the table in HTML form";
-			continue;
-		}
-		if(!table.contains(QRegularExpression("^\\s*<tr\\s*>")))
-		{
-			qWarning().noquote() << "Unexpected table contents (expected it to start with <tr>), keeping the table in HTML form. Table:\n" << table;
-			continue;
-		}
-		if(!table.contains(QRegularExpression("</tr\\s*>\\s*$")))
-		{
-			qWarning().noquote() << "Unexpected table contents (expected it to end with </tr>), keeping the table in HTML form. Table:\n" << table;
-			continue;
-		}
-		auto rows = table.split(QRegularExpression("\\s*</tr\\s*>\\s*"), SkipEmptyParts);
-		// The closing row tags have been removed by QString::split, now remove the opening tags
-		static const QRegularExpression trOpenTag("^\\s*<tr\\s*>\\s*");
-		for(auto& row : rows) row.replace(trOpenTag, "");
-
-		QString markdownTable;
-		// Now convert the rows
-		for(const auto& row : rows)
-		{
-			if(row.simplified().isEmpty()) continue;
-			if(!row.contains(QRegularExpression("^\\s*<t[dh]\\s*>")))
-			{
-				qWarning() << "Unexpected row contents (expected it to start with <td> or <th>), keeping the table in HTML form. Row:" << row;
-				goto nextTable;
-			}
-			if(!row.contains(QRegularExpression("</t[dh]\\s*>\\s*$")))
-			{
-				qWarning() << "Unexpected row contents (expected it to end with </td> or </th>), keeping the table in HTML form. Row:" << row;
-				goto nextTable;
-			}
-			auto cols = row.split(QRegularExpression("\\s*</t[dh]\\s*>\\s*"), SkipEmptyParts);
-			// The closing column tags have been removed by QString::split, now remove the opening tags
-			static const QRegularExpression tdOpenTag("^\\s*<t[dh]\\s*>\\s*");
-			for(auto& col : cols) col.replace(tdOpenTag, "");
-
-			// Finally, emit the rows
-			const bool firstRow = markdownTable.isEmpty();
-			if(firstRow) markdownTable += "\n"; // make sure the table starts as a new paragraph
-			markdownTable += "|";
-			for(const auto& col : cols)
-			{
-				if(col.isEmpty())
-					markdownTable += "   ";
-				else
-					markdownTable += col;
-				markdownTable += '|';
-			}
-			markdownTable += '\n';
-			if(firstRow)
-			{
-				markdownTable += '|';
-				for(const auto& col : cols)
-				{
-					markdownTable += QString(std::max(3, int(col.size())), QChar('-'));
-					markdownTable += '|';
-				}
-				markdownTable += "\n";
-			}
-		}
-
-		// Replace the HTML table with the newly-created Markdown one
-		{
-			const auto lengthToReplace = tablesPositions[n].second - tablesPositions[n].first;
-			string.replace(tablesPositions[n].first, lengthToReplace, markdownTable);
-			// Fixup the positions of the subsequent tables
-			const int delta = markdownTable.size() - lengthToReplace;
-			for(auto& positions : tablesPositions)
-			{
-				positions.first += delta;
-				positions.second += delta;
-			}
-		}
-
-nextTable:
-		continue;
-	}
-
-	// Format the tables that we've failed to convert with each row
-	// on its line, and each column entry on an indented line.
-	string.replace(QRegularExpression("(<tr(?:\\s+[^>]*)*>)"), "\n\\1");
-	string.replace(QRegularExpression("(</tr\\s*>)"), "\n\\1");
-	string.replace(QRegularExpression("(<td(?:\\s+[^>]*)*>)"), "\n\t\\1");
-	string.replace(QRegularExpression("(</table\\s*>)"), "\n\\1");
 }
 
 QString readReferencesFile(const QString& inDir)
@@ -333,120 +152,470 @@ void cleanupWhitespace(QString& markdown)
 	markdown = (startsWithList ? " " : "") + markdown.trimmed() + "\n";
 }
 
-[[nodiscard]] QString convertHTMLToMarkdown(const QString& html, const bool fullerConversionToMarkdown,
-                                            const bool footnotesToRefs, const bool convertOrderedLists)
+QString tidyHTML(const QString& html)
 {
-	QString markdown = html;
+	TidyDoc tdoc = tidyCreate();
+	TidyBuffer output = {};
+	TidyBuffer errbuf = {};
+	int rc = -1;
+	if(tidyOptSetBool(tdoc, TidyXhtmlOut, yes))
+		rc = tidySetErrorBuffer(tdoc, &errbuf);
+	if(rc >= 0)
+		rc = tidyParseString(tdoc, html.toStdString().c_str());
+	if(rc >= 0)
+		rc = tidyCleanAndRepair(tdoc);
+	if(rc > 1)
+		rc = tidyOptSetBool(tdoc, TidyForceOutput, yes) ? rc : -1;
+	if(rc >= 0)
+		rc = tidySaveBuffer(tdoc, &output);
 
-	if(fullerConversionToMarkdown)
-	{
-		markdown.replace(QRegularExpression(R"reg(<\s*html\s+dir="[^"]+"\s*>|</html \s>)reg"), "");
-		markdown.replace(QRegularExpression("[\n\t ]+"), " ");
-	}
+	QString out;
+	if(rc >= 0)
+		out = reinterpret_cast<const char*>(output.bp);
 	else
+		std::cerr << "Failed to parse HTML with HTML Tidy:\n" << errbuf.bp << "\n";
+
+	tidyBufFree(&output);
+	tidyBufFree(&errbuf);
+	tidyRelease(tdoc);
+
+	return out;
+}
+
+void formatImgInHTML(const QDomElement& n, QString& html)
+{
+	html += "<img";
+	if(n.hasAttribute("width"))
+		html += " width=\"" + n.attribute("width") + "\"";
+	if(n.hasAttribute("height"))
+		html += " height=\"" + n.attribute("height") + "\"";
+	if(n.hasAttribute("src"))
+		html += " src=\"" + n.attribute("src") + "\"";
+	if(n.hasAttribute("alt"))
+		html += " alt=\"" + n.attribute("alt") + "\"";
+	html += "/>";
+}
+
+void addSpaceBeforeNodeIfNeeded(QString& markdown, const char space = ' ')
+{
+	if(not markdown.isEmpty() && not markdown[markdown.size() - 1].isSpace())
+		markdown += space;
+}
+
+void formatSectionAsHTML(const QDomElement& secNode, QString& html)
+{
+	QString sec;
+	QTextStream s(&sec);
+	secNode.save(s, 1);
+	addSpaceBeforeNodeIfNeeded(html, '\n');
+	html += sec;
+}
+
+void formatListAsHTML(const QDomElement& listNode, QString& html)
+{
+	return formatSectionAsHTML(listNode, html);
+}
+
+bool processHTMLNode(const QDomNode& parentNode, bool insideTable, bool& h1emitted, QString& markdown);
+bool processTableRow(const QDomElement& rowNode, const bool firstRow, QString& markdown)
+{
+	std::vector<QString> columns;
+	bool isHeader = false;
+	for(auto n = rowNode.firstChild(); !n.isNull(); n = n.nextSibling())
 	{
-		// Twice to handle even/odd cases
-		markdown.replace(QRegularExpression("\n[ \t]*\n"), "\n");
-		markdown.replace(QRegularExpression("\n[ \t]*\n"), "\n");
-	}
-
-	// Replace <notr> and </notr> tags with placeholders that don't
-	// look like tags, so as not to confuse the replacements below.
-	const QString notrOpenPlaceholder = "{22c35d6a-5ec3-4405-aeff-e79998dc95f7}";
-	const QString notrClosePlaceholder = "{2543be41-c785-4283-a4cf-ce5471d2c422}";
-	markdown.replace(QRegularExpression("<notr\\s*>"), notrOpenPlaceholder);
-	markdown.replace(QRegularExpression("</notr\\s*>"), notrClosePlaceholder);
-
-	// Same for <sup> and </sup>.
-	const QString supOpenPlaceholder = "{4edbb3ef-6a33-472a-8faf-1b006dda557c}";
-	const QString supClosePlaceholder = "{e4e12021-9fdf-48de-80ef-e65f0c42738f}";
-	const auto supOpenPlaceholderPattern = "\\" + supOpenPlaceholder;
-	const auto supClosePlaceholderPattern = "\\" + supClosePlaceholder;
-	markdown.replace(QRegularExpression("<sup\\s*>"), supOpenPlaceholder);
-	markdown.replace(QRegularExpression("</sup\\s*>"), supClosePlaceholder);
-
-	if(fullerConversionToMarkdown)
-	{
-		// Replace HTML line breaks with the Markdown ones
-		markdown.replace(QRegularExpression("<br\\s*/?>"), "\n\n");
-
-		const auto replaceEmpasis = [&markdown] {
-			// Replace simple HTML emphases with the Markdown ones
-			markdown.replace(QRegularExpression("<[iI]>(\\s*)([^<\\s]{1,2}|[^<\\s][^<]+[^<\\s])(\\s*)</[iI]>"), "\\1*\\2*\\3");
-			markdown.replace(QRegularExpression("<[eE][mM]>(\\s*)([^<\\s]{1,2}|[^<\\s][^<]+[^<\\s])(\\s*)</[eE][mM]>"), "\\1*\\2*\\3");
-			markdown.replace(QRegularExpression("<[bB]>(\\s*)([^<\\s]{1,2}|[^<\\s][^<]+[^<\\s])(\\s*)</[bB]>"), "\\1**\\2**\\3");
-			markdown.replace(QRegularExpression("<strong>(\\s*)([^<\\s]{1,2}|[^<\\s][^<]+[^<\\s])(\\s*)</strong>"), "\\1**\\2**\\3");
-		};
-		replaceEmpasis();
-
-		// Replace simple HTML images with the Markdown ones
-		markdown.replace(htmlSimpleImageRegex, R"rep(![\1\3](\2))rep");
-
-		if(footnotesToRefs)
+		switch(n.nodeType())
 		{
-			// Hyperlinks to footnotes
-			markdown.replace(QRegularExpression(supOpenPlaceholderPattern+
-			                                     R"regex(\s*<a\s+href="#footnote-([0-9]+)"\s*>\s*\[[^\]]+\]([,\s]*)</a\s*>\s*)regex"+
-			                                     supClosePlaceholderPattern,
-			                                    QRegularExpression::DotMatchesEverythingOption), "[#\\1]\\2");
-		}
-
-		// Replace simple HTML hyperlinks with the Markdown ones
-		//  older version (do we want it?): markdown.replace(QRegularExpression("([^>])<a\\s+href=\"([^\"]+)\"(?:\\s[^>]*)?>([^<]+)</a\\s*>([^<])"), "\\1[\\3](\\2)\\4");
-		markdown.replace(QRegularExpression("<a\\s+href=\"([^\"]+)\"(?:\\s[^>]*)?>([^<]+)</a\\s*>"), "[\\2](\\1)");
-
-		if(footnotesToRefs)
+		case QDomNode::ElementNode:
 		{
-			// First footnote (to prepend <ul> before it)
-			markdown.replace(QRegularExpression(     R"regex(<p\s*id="footnote-(1)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>)regex",
-			                                    QRegularExpression::DotMatchesEverythingOption), "<ul>\n <li>[#\\1]: \\2</li>\n");
-			// Last footnote (to append </ul> after it)
-			markdown.replace(QRegularExpression(R"regex(<p\s*id="footnote-([0-9]+)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>\s*($|<h))regex",
-			                                    QRegularExpression::DotMatchesEverythingOption), " <li>[#\\1]: \\2</li>\n</ul>\n\\3");
-			// Middle footnotes
-			markdown.replace(QRegularExpression(R"regex(<p\s*id="footnote-([0-9]+)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>)regex",
-			                                    QRegularExpression::DotMatchesEverythingOption), " <li>[#\\1]: \\2</li>\n");
+			const auto el = n.toElement();
+			const auto tagName = el.tagName().toLower();
+			if(tagName == "td" || tagName == "th")
+			{
+				if(tagName == "th") isHeader = true;
+
+				columns.push_back("");
+				bool h1emitted = true;
+				if(!processHTMLNode(el, true, h1emitted, columns.back()))
+				{
+					std::cerr << " in a table. Leaving the table in HTML format.\n";
+					return false;
+				}
+			}
+			else
+			{
+				qWarning().nospace() << "Unexpected tag inside <tr>: " << tagName
+				                     << ". Leaving the table in HTML format.\n";
+				return false;
+			}
+			break;
 		}
-
-		// Retry italics etc. This might now work after the above conversions if it hasn't worked before.
-		replaceEmpasis();
-
-		// Replace HTML paragraphs with the Markdown ones
-		markdown.replace(QRegularExpression("<p(?:\\s+[^>]*)*>([^<]+)</p>"), "\n\\1\n");
+		default:
+			qWarning().nospace() << "Unexpected HTML node " << n.nodeType() << " in a table row. Leaving the table in HTML format.";
+			return false;
+		}
 	}
 
-	// Replace simple HTML headings with corresponding Markdown ones
-	for(int n = 1; n <= 6; ++n)
-		markdown.replace(QRegularExpression(QString("<h%1(?:\\s+[^>]*)*>([^<]+)</h%1> *").arg(n)), "\n" + QString(n, QChar('#'))+" \\1\n");
-
-	if(fullerConversionToMarkdown)
+	if(firstRow && !isHeader)
 	{
-		htmlTablesToMarkdown(markdown);
-
-		formatDescriptionLists(markdown);
+		// Create an empty header
+		markdown += "|";
+		for(const auto& column : columns)
+		{
+			markdown += QString(column.size() + 2, QLatin1Char(' '));
+			markdown += "|";
+		}
+		markdown += "\n|";
+		for(const auto& column : columns)
+		{
+			markdown += QString(column.size() + 2, QLatin1Char('-'));
+			markdown += "|";
+		}
+		markdown += "\n";
 	}
 
-	htmlListsToMarkdown(markdown, convertOrderedLists);
-	htmlBlockQuoteToMarkdown(markdown);
-
-	if(fullerConversionToMarkdown)
+	markdown += "|";
+	for(const auto& column : columns)
 	{
-		// Retry paragraphs. This might now work after the above conversions if it hasn't worked before.
-		markdown.replace(QRegularExpression("<p(?:\\s+[^>]*)*>([^<]+)</p>"), "\n\\1\n");
+		markdown += " ";
+		markdown += column;
+		markdown += " |";
 	}
-	else
+	markdown += "\n";
+
+	if(firstRow && isHeader)
 	{
-		markdown.replace(QRegularExpression("<p\\s*>([^<]+)</p>"), "\n\\1\n");
+		markdown += "|";
+		for(const auto& column : columns)
+		{
+			markdown += QString(column.size() + 2, QLatin1Char('-'));
+			markdown += "|";
+		}
+		markdown += "\n";
+	}
+	return true;
+}
+
+void processTable(const QDomElement& tableNode, QString& markdown)
+{
+	// Let's try formatting it until we find an item that we can't have in a Markdown table
+	QString table;
+	bool processingFirstRow = true;
+	for(auto n = tableNode.firstChild(); !n.isNull(); n = n.nextSibling())
+	{
+		switch(n.nodeType())
+		{
+		case QDomNode::ElementNode:
+		{
+			const auto el = n.toElement();
+			const auto tagName = el.tagName().toLower();
+			if(tagName == "tr")
+			{
+				if(el.hasAttribute("colspan") || el.hasAttribute("rowspan"))
+				{
+					qWarning().nospace() << "Table colspan and rowspan are not supported in Markdown. Leaving the table in HTML format.";
+					formatSectionAsHTML(tableNode, markdown);
+					return;
+				}
+				if(!processTableRow(el, processingFirstRow, table))
+				{
+					formatSectionAsHTML(tableNode, markdown);
+					return;
+				}
+				processingFirstRow = false;
+			}
+			else
+			{
+				qWarning().nospace() << "Unexpected tag inside <table>: " << tagName
+				                     << ". Leaving the table in HTML format.\n";
+				formatSectionAsHTML(tableNode, markdown);
+				return;
+			}
+			break;
+		}
+		default:
+			qWarning().nospace() << "Unexpected HTML node " << n.nodeType() << " in a table. Leaving the table in HTML format.";
+			formatSectionAsHTML(tableNode, markdown);
+			return;
+		}
+	}
+	markdown += table;
+}
+
+void processList(const QDomElement& listNode, QString& markdown)
+{
+	std::vector<QString> items;
+	for(auto n = listNode.firstChild(); !n.isNull(); n = n.nextSibling())
+	{
+		switch(n.nodeType())
+		{
+		case QDomNode::ElementNode:
+		{
+			const auto el = n.toElement();
+			const auto tagName = el.tagName().toLower();
+			if(tagName == "li")
+			{
+				items.push_back("");
+				bool h1emitted = true;
+				if(!processHTMLNode(el, true, h1emitted, items.back()))
+				{
+					std::cerr << " in a list. Leaving the list in HTML format.\n";
+					formatListAsHTML(listNode, markdown);
+					return;
+				}
+			}
+			else
+			{
+				qWarning().nospace() << "Unexpected tag inside a list: " << tagName
+				                     << ". Leaving the list in HTML format.\n";
+				formatListAsHTML(listNode, markdown);
+				return;
+			}
+			break;
+		}
+		default:
+			qWarning().nospace() << "Unexpected HTML node " << n.nodeType() << " in a list. Leaving the list in HTML format.";
+			formatListAsHTML(listNode, markdown);
+			return;
+		}
 	}
 
-	cleanupWhitespace(markdown);
+	const bool ordered = listNode.tagName() == "ol";
+	if(not markdown.isEmpty() && markdown[markdown.size() - 1] != '\n')
+		markdown += '\n';
+	for(unsigned i = 0; i < items.size(); ++i)
+	{
+		if(ordered)
+			markdown += QString(" %1. ").arg(i+1);
+		else
+			markdown += " - ";
+		markdown += items[i];
+		markdown += '\n';
+	}
+}
 
-	// Restore the reserved tags
-	markdown.replace(notrOpenPlaceholder,  "<notr>");
-	markdown.replace(notrClosePlaceholder, "</notr>");
-	markdown.replace(supOpenPlaceholder,  "<sup>");
-	markdown.replace(supClosePlaceholder, "</sup>");
+bool processHTMLNode(const QDomNode& parentNode, bool insideTable, bool& h1emitted, QString& markdown)
+{
+	for(auto n = parentNode.firstChild(); !n.isNull(); n = n.nextSibling())
+	{
+		switch(n.nodeType())
+		{
+		case QDomNode::ElementNode:
+		{
+			const auto el = n.toElement();
+			const auto tagName = el.tagName().toLower();
+			if(tagName == "h1")
+			{
+				if(insideTable)
+				{
+					std::cerr << "WARNING: Unexpected <h1> tag";
+					return false;
+				}
 
+				if(h1emitted)
+				{
+					std::cerr << "WARNING: Unexpected repeated <h1> tag. Demoting it to <h3>.\n";
+					markdown += "\n### ";
+					markdown += el.text().simplified();
+					markdown += '\n';
+				}
+				else
+				{
+					markdown += "\n# ";
+					markdown += el.text().simplified();
+					markdown += '\n';
+					h1emitted = true;
+				}
+			}
+			else if(tagName.size() == 2 && tagName[0] == QLatin1Char('h') && '2' <= tagName[1] && tagName[1] <= '6')
+			{
+				if(insideTable)
+				{
+					std::cerr << "WARNING: Unexpected <h1> tag";
+					return false;
+				}
+
+				if(!h1emitted)
+					std::cerr << "ERROR: Unexpected <" << tagName.toStdString() << "> tag before any <h1> tag was found\n";
+
+				const int level = tagName[1].toLatin1() - '0';
+				markdown += '\n';
+				markdown += QString(level, QLatin1Char('#'));
+				markdown += ' ';
+				markdown += el.text().simplified();
+				markdown += '\n';
+			}
+			else if(tagName == "i" || tagName == "em" || tagName == "b")
+			{
+				const QString marking = tagName == "b" ? "**" : "*";
+
+				QString text;
+				processHTMLNode(n, insideTable, h1emitted, text);
+				addSpaceBeforeNodeIfNeeded(markdown);
+				markdown += marking;
+				markdown += text;
+				markdown += marking;
+			}
+			else if(tagName == "p")
+			{
+				if(el.hasAttribute("id"))
+				{
+					formatSectionAsHTML(el, markdown);
+				}
+				else
+				{
+					markdown += "\n";
+					processHTMLNode(n, insideTable, h1emitted, markdown);
+					markdown += "\n";
+				}
+			}
+			else if(tagName == "img")
+			{
+				if(el.hasAttribute("width") || el.hasAttribute("height"))
+				{
+					formatImgInHTML(el, markdown);
+				}
+				else
+				{
+					addSpaceBeforeNodeIfNeeded(markdown);
+					markdown += "![";
+					markdown += el.attribute("alt");
+					markdown += "](";
+					markdown += el.attribute("src");
+					markdown += ")";
+				}
+			}
+			else if(tagName == "a")
+			{
+				addSpaceBeforeNodeIfNeeded(markdown);
+				markdown += "[";
+				QString content;
+				processHTMLNode(n, insideTable, h1emitted, content);
+				if(content.contains("[") || content.contains("]"))
+					qWarning() << "WARNING: found a link whose text contains square brackets. This may interfere with Markdown parsing.\n";
+				markdown += content.trimmed();
+				markdown += "](";
+				markdown += el.attribute("href");
+				markdown += ")";
+			}
+			else if(tagName == "br")
+			{
+				if(insideTable)
+					markdown += "<br>";
+				else
+					markdown += "\n\n";
+			}
+			else if(tagName == "table")
+			{
+				if(el.attribute("class") == "layout")
+				{
+					// We can't add a class attribute to a Markdown table, so keep it in HTML
+					qWarning() << "Markdown tables don't support class \"layout\", leaving such a table in HTML format.";
+					formatSectionAsHTML(el, markdown);
+				}
+				else
+				{
+					processTable(el, markdown);
+				}
+			}
+			else if(tagName == "ul" || tagName == "ol")
+			{
+				processList(el, markdown);
+			}
+			else if(tagName == "blockquote")
+			{
+				QString blockquote;
+				processHTMLNode(n, insideTable, h1emitted, blockquote);
+				blockquote = blockquote.trimmed();
+				blockquote.replace("\n", "\n> ");
+				addSpaceBeforeNodeIfNeeded(markdown, '\n');
+				markdown += "\n> ";
+				markdown += blockquote;
+				markdown += "\n";
+			}
+			else
+			{
+				qDebug() << "WARNING: Unhandled HTML element:" << n.toElement().tagName();
+			}
+			break;
+		}
+		case QDomNode::TextNode:
+			addSpaceBeforeNodeIfNeeded(markdown);
+			markdown += n.toText().data().simplified();
+			break;
+		case QDomNode::CommentNode:
+			addSpaceBeforeNodeIfNeeded(markdown, '\n');
+			markdown += "<!--";
+			markdown += n.toComment().data();
+			markdown += "-->";
+			break;
+		default:
+		{
+			qWarning().nospace() << "WARNING: Unhandled HTML node: " << n.nodeType() << ". Formatting as HTML.";
+			QString text;
+			QTextStream s(&text);
+			n.save(s, 1);
+			markdown += text;
+			break;
+		}
+		}
+	}
+	return true;
+}
+
+[[nodiscard]] QString convertHTMLToMarkdown(const QString& htmlIn, const bool footnotesToRefs)
+{
+	const auto html = tidyHTML(htmlIn);
+
+	QString markdown;
+
+	QDomDocument dom;
+	dom.setContent(html);
+
+	QDomNode n;
+	bool bodyFound = false;
+	for(n = dom.firstChild(); !n.isNull(); n = n.nextSibling())
+	{
+		if(n.isElement() && n.toElement().tagName() == "html")
+			for(n = n.firstChild(); !n.isNull(); n = n.nextSibling())
+				if(n.isElement() && n.toElement().tagName() == "body")
+				{
+					bodyFound = true;
+					goto afterBodyFound;
+				}
+	}
+	if(!bodyFound)
+	{
+		std::cerr << "Failed to found HTML <body> tag in tidied HTML\n";
+		return {};
+	}
+afterBodyFound:
+
+	bool h1emitted = false;
+	processHTMLNode(n, false, h1emitted, markdown);
+
+//		if(footnotesToRefs)
+//		{
+//			// Hyperlinks to footnotes
+//			markdown.replace(QRegularExpression(supOpenPlaceholderPattern+
+//							    R"regex(\s*<a\s+href="#footnote-([0-9]+)"\s*>\s*\[[^\]]+\]([,\s]*)</a\s*>\s*)regex"+
+//							    supClosePlaceholderPattern,
+//							    QRegularExpression::DotMatchesEverythingOption), "[#\\1]\\2");
+//		}
+//
+//		if(footnotesToRefs)
+//		{
+//			// First footnote (to prepend <ul> before it)
+//			markdown.replace(QRegularExpression(     R"regex(<p\s*id="footnote-(1)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>)regex",
+//								 QRegularExpression::DotMatchesEverythingOption), "<ul>\n <li>[#\\1]: \\2</li>\n");
+//			// Last footnote (to append </ul> after it)
+//			markdown.replace(QRegularExpression(R"regex(<p\s*id="footnote-([0-9]+)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>\s*($|<h))regex",
+//							    QRegularExpression::DotMatchesEverythingOption), " <li>[#\\1]: \\2</li>\n</ul>\n\\3");
+//			// Middle footnotes
+//			markdown.replace(QRegularExpression(R"regex(<p\s*id="footnote-([0-9]+)"\s*>(?:\[[^\]]+\] *)?([^<]*)</p\s*>)regex",
+//							    QRegularExpression::DotMatchesEverythingOption), " <li>[#\\1]: \\2</li>\n");
+//		}
+//		formatDescriptionLists(markdown);
+//
 	return markdown;
 }
 
@@ -958,8 +1127,7 @@ void DescriptionOldLoader::locateAndRelocateAllInlineImages(QString& html, const
 void DescriptionOldLoader::load(const QString& inDir, const QString& poBaseDir, const QString& cultureId, const QString& englishName,
                                 const QString& author, const QString& credit, const QString& license,
                                 const ConstellationOldLoader& consLoader, const AsterismOldLoader& astLoader, const NamesOldLoader& namesLoader,
-                                const bool fullerConversionToMarkdown, const bool footnotesToRefs, const bool convertOrderedLists,
-                                const bool genTranslatedMD)
+                                const bool footnotesToRefs, const bool genTranslatedMD)
 {
 	inputDir = inDir;
 	const auto englishDescrPath = inDir+"/description.en.utf8";
@@ -972,7 +1140,7 @@ void DescriptionOldLoader::load(const QString& inDir, const QString& poBaseDir, 
 	QString html = englishDescrFile.readAll();
 	locateAndRelocateAllInlineImages(html, true);
 	qDebug() << "Processing English description...";
-	markdown = convertHTMLToMarkdown(html, fullerConversionToMarkdown, footnotesToRefs, convertOrderedLists);
+	markdown = convertHTMLToMarkdown(html, footnotesToRefs);
 
 	auto englishSections = splitToSections(markdown);
 	const int level1sectionCount = std::count_if(englishSections.begin(), englishSections.end(),
@@ -1077,7 +1245,7 @@ void DescriptionOldLoader::load(const QString& inDir, const QString& poBaseDir, 
 		qDebug().nospace() << "Processing description for locale " << locale << "...";
 		QString localizedHTML = file.readAll();
 		locateAndRelocateAllInlineImages(localizedHTML, false);
-		auto trMD0 = convertHTMLToMarkdown(localizedHTML, fullerConversionToMarkdown, footnotesToRefs, convertOrderedLists);
+		auto trMD0 = convertHTMLToMarkdown(localizedHTML, footnotesToRefs);
 		const auto translationMD = trMD0.replace(QRegularExpression("<notr>([^<]+)</notr>"), "\\1");
 		const auto translatedSections = splitToSections(translationMD);
 		if(translatedSections.size() != englishSections.size())
