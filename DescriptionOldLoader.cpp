@@ -532,6 +532,14 @@ bool processHTMLNode(const QDomNode& parentNode, bool insideTable, bool& h1emitt
 				markdown += blockquote;
 				markdown += "\n";
 			}
+			else if(tagName == "sup" || tagName == "sub")
+			{
+				// Markdown doesn't have any special way to format these
+				QString text;
+				QTextStream s(&text);
+				n.save(s, 0);
+				markdown += text.simplified();
+			}
 			else
 			{
 				qDebug() << "WARNING: Unhandled HTML element:" << n.toElement().tagName();
